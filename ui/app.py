@@ -38,6 +38,7 @@ class DiagramCanvas(tk.Canvas):
         self.edges = []
         self.edge_routes = {}
         self.edge_label_positions = {}
+        self.loop_sides = {}
         self.start_state = None
         self.active_states = set()
         self.current_state = None
@@ -102,7 +103,6 @@ class DiagramCanvas(tk.Canvas):
         w = max(self.winfo_width(), 800)
         h = max(self.winfo_height(), 600)
         spacing = max(12, int(28 * self.zoom))
-        # Draw enough lines to cover the viewport.
         x0 = -(self.offset_x % spacing)
         y0 = -(self.offset_y % spacing)
         for x in range(int(x0), w + spacing, spacing):
@@ -142,14 +142,15 @@ class DiagramCanvas(tk.Canvas):
         return x * self.zoom + self.offset_x, y * self.zoom + self.offset_y
 
     def _node_radius(self):
-        # Keep state names readable when a laptop-sized window causes FIT to
-        # use a lower zoom level. The generous spacing in the DFA layout
-        # prevents these minimum-size nodes from colliding.
         return max(20, 28 * self.zoom)
 
     def _diagram_font_size(self, base, minimum):
         """Scale text while retaining a readable minimum at small zoom."""
         return max(minimum, int(base * max(self.zoom, .72)))
+
+    def _arrow_shape(self):
+        z = max(self.zoom, .5)
+        return (9 * z, 11 * z, 4 * z)
 
     def _node_label(self, state):
         if self.prefix == "D":
@@ -162,12 +163,38 @@ class DiagramCanvas(tk.Canvas):
             return f"M{state}"
         return f"q{state}"
 
+    # ---- geometry helpers -------------------------------------------------
+    @staticmethod
+    def _toward(a, b, dist):
+        """Point `dist` away from a in the direction of b."""
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        d = math.hypot(dx, dy) or 1
+        return a[0] + dx / d * dist, a[1] + dy / d * dist
+
+    def _circle_hit(self, outside, hint, center, r):
+        """First point where the ray outside -> hint meets a circle.
+
+        Used so every arrow starts and ends exactly on a node's outline
+        (arrowheads are no longer hidden underneath the node fill).
+        """
+        dx, dy = hint[0] - outside[0], hint[1] - outside[1]
+        a = dx * dx + dy * dy
+        if a == 0:
+            return hint
+        fx, fy = outside[0] - center[0], outside[1] - center[1]
+        b = 2 * (dx * fx + dy * fy)
+        c = fx * fx + fy * fy - r * r
+        disc = b * b - 4 * a * c
+        if disc < 0:
+            return self._toward(center, outside, r)
+        t = (-b - math.sqrt(disc)) / (2 * a)
+        return outside[0] + t * dx, outside[1] + t * dy
+
     def render(self):
         self.delete("all")
         self._draw_grid()
         r = self._node_radius()
 
-        # Edges first so nodes sit above them.
         visible_nodes = self.active_states if self.path_only else set(self.nodes)
         if self.path_only and not visible_nodes:
             self.create_text(self.winfo_width() / 2, self.winfo_height() / 2,
@@ -181,62 +208,73 @@ class DiagramCanvas(tk.Canvas):
                 fill="#c6d0d8", width=1.5, arrow=tk.LAST,
                 arrowshape=(8 * max(self.zoom, .5), 10 * max(self.zoom, .5), 4 * max(self.zoom, .5)),
             )
+            self.create_text(x - r - 20 * self.zoom, y - 12, text="START", fill=MUTED,
+                             font=("Segoe UI", self._diagram_font_size(8, 7), "bold"))
 
         for edge_index, (src, dst, label) in enumerate(self.edges + self.extra_edges):
             if src not in self.nodes or dst not in self.nodes:
                 continue
             if self.path_only and (src not in visible_nodes or dst not in visible_nodes):
                 continue
-            x1, y1 = self._p(*self.nodes[src])
-            x2, y2 = self._p(*self.nodes[dst])
+            c1 = self._p(*self.nodes[src])
+            c2 = self._p(*self.nodes[dst])
             active = edge_index in self.active_edges or edge_index >= len(self.edges)
             color = ACCENT if active else ("#273038" if self.focused else "#5b6670")
             width = 2.4 if active else 1.2
+            label_color = ACCENT if active else "#c6d0d8"
+            label_font = ("Segoe UI", self._diagram_font_size(9, 8), "bold")
 
             if src == dst:
-                self._draw_loop(x1, y1, r, label, color, width)
+                self._draw_loop(c1[0], c1[1], r, label, color, width,
+                                self.loop_sides.get(src, "top"))
                 continue
 
             route = self.edge_routes.get((src, dst))
-            if route is not None:
-                points = [(x1, y1)] + [self._p(*point) for point in route] + [(x2, y2)]
-                self.create_line(
-                    *(coordinate for point in points for coordinate in point),
-                    fill=color, width=width, arrow=tk.LAST,
-                    arrowshape=(9 * max(self.zoom, .5), 11 * max(self.zoom, .5), 4 * max(self.zoom, .5)),
-                )
-                label_world = self.edge_label_positions.get((src, dst))
+            label_world = self.edge_label_positions.get((src, dst))
+
+            if route and len(route) >= 2:
+                # Explicit elbow route: waypoints are fixed by the layout;
+                # only the two ends are snapped onto the node outlines.
+                pts = [self._p(*pt) for pt in route]
+                first = self._circle_hit(pts[1], pts[0], c1, r)
+                last = self._circle_hit(pts[-2], pts[-1], c2, r)
+                pts[0], pts[-1] = first, last
+                self.create_line(*(v for pt in pts for v in pt),
+                                 fill=color, width=width, arrow=tk.LAST,
+                                 arrowshape=self._arrow_shape(), joinstyle=tk.MITER)
                 if label_world:
-                    cx, cy = self._p(*label_world)
+                    lx, ly = self._p(*label_world)
                 else:
-                    segments = list(zip(points, points[1:]))
-                    start, end = max(segments, key=lambda segment: math.dist(*segment))
-                    cx, cy = (start[0] + end[0]) / 2, (start[1] + end[1]) / 2 - 11
-                self.create_text(cx, cy, text=label, fill=ACCENT if active else "#c6d0d8",
-                                 font=("Segoe UI", self._diagram_font_size(9, 8), "bold"))
+                    segs = list(zip(pts, pts[1:]))
+                    a, b = max(segs, key=lambda s: math.dist(*s))
+                    lx, ly = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2 - 11
+                self.create_text(lx, ly, text=label, fill=label_color, font=label_font)
                 continue
 
-            dx, dy = x2 - x1, y2 - y1
+            if label_world:
+                # Straight arrow between node outlines.
+                start = self._toward(c1, c2, r)
+                end = self._toward(c2, c1, r)
+                self.create_line(*start, *end, fill=color, width=width, arrow=tk.LAST,
+                                 arrowshape=self._arrow_shape())
+                lx, ly = self._p(*label_world)
+                self.create_text(lx, ly, text=label, fill=label_color, font=label_font)
+                continue
+
+            # Default (used by the NFA): gently curved edge.
+            dx, dy = c2[0] - c1[0], c2[1] - c1[1]
             dist = max(math.hypot(dx, dy), 1)
             nx, ny = -dy / dist, dx / dist
             bend = min(38 * self.zoom, max(0, dist * 0.12))
-            # Deterministic bend based on state pair prevents everything from becoming straight.
             sign = -1 if (int(src) + int(dst)) % 2 else 1
-            cx = (x1 + x2) / 2 + nx * bend * sign
-            cy = (y1 + y2) / 2 + ny * bend * sign
-
-            self.create_line(
-                x1, y1, cx, cy, x2, y2,
-                fill=color, width=width, smooth=True,
-                arrow=tk.LAST,
-                arrowshape=(9 * max(self.zoom, .5), 11 * max(self.zoom, .5), 4 * max(self.zoom, .5)),
-            )
-            self.create_text(
-                cx, cy - 10 * max(self.zoom, .6),
-                text=label,
-                fill=ACCENT if active else "#c6d0d8",
-                font=("Segoe UI", self._diagram_font_size(9, 8), "bold"),
-            )
+            cx = (c1[0] + c2[0]) / 2 + nx * bend * sign
+            cy = (c1[1] + c2[1]) / 2 + ny * bend * sign
+            start = self._toward(c1, (cx, cy), r)
+            end = self._toward(c2, (cx, cy), r)
+            self.create_line(*start, cx, cy, *end, fill=color, width=width, smooth=True,
+                             arrow=tk.LAST, arrowshape=self._arrow_shape())
+            self.create_text(cx, cy - 10 * max(self.zoom, .6), text=label,
+                             fill=label_color, font=label_font)
 
         # Nodes.
         for state, (x, y) in self.nodes.items():
@@ -262,25 +300,43 @@ class DiagramCanvas(tk.Canvas):
                 font=("Segoe UI", self._diagram_font_size(10, 9), "bold")
             )
 
-        # Keep the full logical canvas available for panning.
         self.configure(scrollregion=(-2000, -2000, 6000, 5000))
 
-    def _draw_loop(self, x, y, r, label, color, width):
-        loop_r = max(18, r * 1.15)
-        box = (x-loop_r, y-r*1.9, x+loop_r, y+r*0.15)
-        self.create_arc(*box, start=25, extent=290, style=tk.ARC,
-                        outline=color, width=width)
-        self.create_text(
-            x, y-r*2.0, text=label, fill=color,
-            font=("Segoe UI", self._diagram_font_size(8, 8), "bold")
-        )
+    def _draw_loop(self, x, y, r, label, color, width, side="top"):
+        """Self-loop bulging out of the node on the requested side."""
+        angle = math.radians({"top": -90, "right": 0, "bottom": 90, "left": 180}.get(side, -90))
+        spread = math.radians(38)
+        lift = r * 3.4
+        dx, dy = math.cos(angle), math.sin(angle)
+
+        def on(a, dist):
+            return x + dist * math.cos(a), y + dist * math.sin(a)
+
+        p0 = on(angle - spread, r)
+        p3 = on(angle + spread, r)
+        c1 = on(angle - spread * 1.5, r + lift)
+        c2 = on(angle + spread * 1.5, r + lift)
+        pts = []
+        for i in range(25):
+            t = i / 24
+            m = 1 - t
+            pts.append((
+                m**3 * p0[0] + 3 * m * m * t * c1[0] + 3 * m * t * t * c2[0] + t**3 * p3[0],
+                m**3 * p0[1] + 3 * m * m * t * c1[1] + 3 * m * t * t * c2[1] + t**3 * p3[1],
+            ))
+        self.create_line(*(v for p in pts for v in p), fill=color, width=width,
+                         arrow=tk.LAST, arrowshape=self._arrow_shape())
+        label_dist = r * 1.8 + 10 + 4 * self.zoom
+        self.create_text(x + dx * label_dist, y + dy * label_dist, text=label, fill=color,
+                         font=("Segoe UI", self._diagram_font_size(8, 8), "bold"))
 
     def set_graph(self, nodes, edges, final_states=None, start_state=None, dead_state=None, dead_aliases=None,
-                  edge_routes=None, edge_label_positions=None):
+                  edge_routes=None, edge_label_positions=None, loop_sides=None):
         self.nodes = dict(nodes)
         self.edges = list(edges)
         self.edge_routes = dict(edge_routes or {})
         self.edge_label_positions = dict(edge_label_positions or {})
+        self.loop_sides = dict(loop_sides or {})
         self.start_state = start_state
         if final_states is not None:
             self.final_states = set(final_states)
@@ -310,8 +366,6 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Automata Command Recognizer")
-        # Let the window fit compact laptop displays; the panes and tables
-        # can shrink and scroll instead of extending past the screen.
         self.root.geometry("1280x820")
         self.root.minsize(760, 560)
         self.root.configure(bg=BG)
@@ -428,8 +482,6 @@ class App:
         tk.Label(left, text="STATE TRACE", bg=PANEL, fg=MUTED,
                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=15, pady=(18, 7))
         trace_tabs = ttk.Notebook(left)
-        # A small requested height keeps the trace/history area visible even
-        # before the window has extra vertical room to distribute.
         trace_tabs.pack(fill="both", expand=True, padx=12, pady=(0, 12), ipady=70)
         self.trace_tabs = trace_tabs
         self.trace_views = {}
@@ -510,8 +562,6 @@ class App:
         width = max(220, event.width - 48)
         self.explanation.config(wraplength=width)
 
-        # Keep useful fields visible on narrow screens.  A horizontal bar is
-        # still available when the user needs the full command or timestamp.
         trace_width = max(210, event.width - 45)
         for view in self.trace_views.values():
             view.column("step", width=max(45, int(trace_width * .18)), stretch=False)
@@ -564,23 +614,34 @@ class App:
         self.check()
 
     def _load_diagrams(self):
-        # Coordinates match the supplied DFA diagram. The qd nodes are visual
-        # aliases of one dead state, placed beside their incoming branches.
-        positions = {
+        # ------------------------------------------------------------------
+        # DFA layout. Every coordinate below is read straight off the
+        # reference diagram (pixel coordinates of the image) and multiplied
+        # by K so the nodes (radius 28) have the same proportions as there.
+        # ------------------------------------------------------------------
+        K = 0.7
+
+        def w(pt):
+            return (pt[0] * K, pt[1] * K)
+
+        img_positions = {
             # Shared start and LOG prefix.
-            0:(123,522), 1:(264,522), 2:(403,522), 3:(516,410),
-            # LOGOUT branch and shared final state.
-            4:(656,334), 5:(796,334), 6:(936,334), 7:(1173,459),
+            0: (200, 740), 1: (400, 740), 2: (600, 740), 3: (760, 580),
+            # LOGOUT branch and final state.
+            4: (960, 470), 5: (1160, 470), 6: (1360, 470), 7: (1700, 650),
             # EXIT and HELP lanes.
-            8:(264,256), 9:(404,256),
-            10:(264,32), 11:(404,32), 12:(544,32),
+            8: (400, 360), 9: (600, 360),
+            10: (400, 40), 11: (600, 40), 12: (800, 40),
             # SAVE, LOAD, LOGIN and the shared identifier suffix.
-            13:(264,823), 14:(404,823), 15:(544,823), 16:(516,690),
-            17:(656,508), 18:(656,690), 19:(908,690), 20:(1048,690),
-            # Actual qd follows M7; the other three qd nodes are aliases.
-            21:(1305,459), 22:(404,157), 23:(320,670), 24:(936,471),
+            13: (400, 1170), 14: (600, 1170), 15: (800, 1170), 16: (760, 980),
+            17: (970, 720), 18: (970, 980), 19: (1320, 980), 20: (1520, 980),
+            # qd nodes: 21 = the real dead state (right of D7),
+            # 22 = top (HELP/EXIT lanes), 23 = bottom-left, 24 = centre-right.
+            21: (1890, 650), 22: (600, 220), 23: (480, 950), 24: (1360, 670),
         }
+        positions = {s: w(p) for s, p in img_positions.items()}
         assert set(range(self.dfa.state_count)).issubset(positions)
+
         dead_aliases = {22, 23, 24}
         dead_destinations = {
             0: 23, 1: 23, 2: 23,
@@ -593,52 +654,75 @@ class App:
             (source, dead_destinations.get(source, destination) if destination == self.dfa.dead_state else destination, label)
             for source, destination, label in self.dfa.grouped_edges(include_dead_transitions=True)
         ]
-        # Each qd alias visibly loops for every following input, even though
-        # all aliases resolve to one real dead state in the DFA engine.
+        # Each qd alias visibly loops for every following input.
         dfa_edges.extend((alias, alias, "Σ") for alias in dead_aliases)
-        # Explicit elbow routes reproduce the clean command lanes in the
-        # reference diagram; labels are placed in open space near each lane.
-        routes = {
-            (0, 8): [(143, 256)], (0, 10): [(104, 32)], (0, 13): [(104, 823)],
-            (2, 3): [(516, 522)], (2, 16): [(516, 690)],
-            (3, 4): [(543, 334)], (3, 17): [(543, 508)],
-            (6, 7): [(1173, 334)], (7, 21): [(1305, 459)],
-            (9, 5): [(796, 256)], (12, 6): [(936, 32)],
-            (15, 18): [(656, 823)], (20, 7): [(1173, 690)],
+
+        # Elbow routes (first/last point only give the direction; the canvas
+        # snaps them onto the node outlines so arrowheads stay visible).
+        img_routes = {
+            (0, 8):   [(230, 712), (230, 360), (360, 360)],
+            (0, 10):  [(172, 712), (172, 40), (360, 40)],
+            (0, 13):  [(200, 780), (200, 1170), (360, 1170)],
+            (2, 3):   [(640, 712), (760, 712), (760, 620)],
+            (2, 16):  [(640, 768), (760, 768), (760, 940)],
+            (3, 4):   [(785, 550), (785, 470), (920, 470)],
+            (3, 17):  [(790, 606), (790, 720), (930, 720)],
+            (9, 5):   [(640, 360), (1160, 360), (1160, 430)],
+            (12, 6):  [(840, 40), (1360, 40), (1360, 430)],
+            (6, 7):   [(1400, 470), (1700, 470), (1700, 610)],
+            (20, 7):  [(1560, 980), (1700, 980), (1700, 690)],
+            (15, 18): [(840, 1170), (970, 1170), (970, 1020)],
         }
-        label_positions = {
-            (0, 8): (193, 245), (0, 10): (162, 20), (0, 13): (177, 812),
-            (2, 3): (460, 490), (2, 16): (458, 610), (3, 4): (590, 323),
-            (3, 17): (584, 496), (6, 7): (1060, 322), (7, 21): (1238, 447),
-            (9, 5): (600, 245), (12, 6): (730, 20), (15, 18): (602, 812),
-            (20, 7): (1162, 574),
-            # Keep each missing-input label away from the qd convergence point.
-            (0, 23): (205, 590), (1, 23): (286, 600), (2, 23): (375, 602),
-            (8, 22): (302, 190), (9, 22): (465, 193),
-            (10, 22): (330, 92), (11, 22): (470, 92), (12, 22): (560, 92),
-            (3, 24): (700, 400), (4, 24): (755, 384), (5, 24): (847, 384),
-            (6, 24): (968, 395), (17, 24): (785, 490),
-            (13, 23): (245, 746), (14, 23): (365, 744), (15, 23): (485, 742),
-            (16, 23): (420, 660), (18, 24): (780, 598), (19, 24): (900, 570),
-            (20, 24): (1020, 560),
+        routes = {key: [w(p) for p in pts] for key, pts in img_routes.items()}
+
+        img_labels = {
+            # Straight edges.
+            (0, 1): (305, 722), (1, 2): (520, 722),
+            (4, 5): (1060, 455), (5, 6): (1260, 455),
+            (8, 9): (500, 345),
+            (10, 11): (505, 20), (11, 12): (695, 20),
+            (13, 14): (500, 1155), (14, 15): (700, 1155),
+            (16, 18): (860, 965), (17, 18): (950, 850),
+            (18, 19): (1140, 965), (19, 20): (1418, 965),
+            (7, 21): (1790, 635),
+            # Elbow edges.
+            (0, 8): (299, 345), (0, 10): (255, 20), (0, 13): (299, 1155),
+            (2, 3): (700, 695), (2, 16): (700, 755),
+            (3, 4): (860, 455), (3, 17): (870, 645),
+            (9, 5): (940, 345), (12, 6): (955, 20),
+            (6, 7): (1560, 455), (20, 7): (1620, 965),
+            (15, 18): (990, 1095),
+            # Edges into the dead-state aliases.
+            (0, 23): (330, 855), (1, 23): (470, 825), (2, 23): (590, 845),
+            (13, 23): (385, 1065), (14, 23): (530, 1095),
+            (15, 23): (720, 1075), (16, 23): (650, 949),
+            (8, 22): (440, 285), (9, 22): (650, 285),
+            (10, 22): (445, 155), (11, 22): (565, 125), (12, 22): (680, 115),
+            (3, 24): (990, 595), (4, 24): (1170, 565), (5, 24): (1290, 565),
+            (6, 24): (1410, 565), (17, 24): (1120, 695),
+            (18, 24): (1120, 855), (19, 24): (1280, 903), (20, 24): (1498, 835),
         }
-        for source, destination, _label in dfa_edges:
-            if destination in dead_aliases or (destination == self.dfa.dead_state and source != self.dfa.dead_state):
-                routes.setdefault((source, destination), [])
+        label_positions = {key: w(p) for key, p in img_labels.items()}
+
+        # Side of the node on which each self-loop is drawn (as in the
+        # reference diagram): D20 and the right-most qd on top, the others
+        # on the side that is free of incoming arrows.
+        loop_sides = {20: "top", 21: "top", 22: "right", 23: "left", 24: "right"}
+
         self.dfa_canvas.set_graph(positions, dfa_edges, self.dfa.final_states,
                                   start_state=self.dfa.start, dead_state=self.dfa.dead_state,
                                   dead_aliases=dead_aliases, edge_routes=routes,
-                                  edge_label_positions=label_positions)
+                                  edge_label_positions=label_positions, loop_sides=loop_sides)
 
         # NFA layout mirrors the six epsilon branches in the supplied diagram.
-        npos = {0:(70,390)}
+        npos = {0: (70, 390)}
         branches = [
-            ([1,2,3,4,5,6,7,8], 70),
-            ([9,10,11,12,13,14], 170),
-            ([15,16,17,18,19,20], 270),
-            ([21,22,23,24,25,26,27,28,29], 390),
-            ([30,31,32,33,34,35,36,37], 520),
-            ([38,39,40,41,42,43,44,45], 650),
+            ([1, 2, 3, 4, 5, 6, 7, 8], 70),
+            ([9, 10, 11, 12, 13, 14], 170),
+            ([15, 16, 17, 18, 19, 20], 270),
+            ([21, 22, 23, 24, 25, 26, 27, 28, 29], 390),
+            ([30, 31, 32, 33, 34, 35, 36, 37], 520),
+            ([38, 39, 40, 41, 42, 43, 44, 45], 650),
         ]
         for ids, y in branches:
             for i, state in enumerate(ids):
@@ -647,8 +731,6 @@ class App:
         nedges = [(src, dst, label) for src, label, dst in self.nfa.transitions_for_diagram()]
         self.nfa_canvas.set_graph(npos, nedges, self.nfa.final_states,
                                   start_state=self.nfa.start)
-        # The simulation view starts empty; full diagrams remain available via
-        # VIEW FULL.
         self.dfa_canvas.show_full(False)
         self.nfa_canvas.show_full(False)
 
@@ -766,8 +848,6 @@ class App:
             for row in rows:
                 tv.insert("", "end", values=(row["step"], row["input"], row["state"]))
 
-        # Initial display is the completed path; TRACE PREV/NEXT shows its
-        # simulator-generated character-by-character prefixes.
         self.trace_step = max(len(result["dfa_trace"]), len(result["nfa_path_trace"])) - 1
         self._highlight_trace_step()
         if save_history:
